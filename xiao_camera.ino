@@ -26,23 +26,23 @@ String CAMERA_API_KEY = "cameraapisecretkeyafagalglhlia";
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
-#define FLASH_LED_PIN     21 // Verify if XIAO has this flash pin
+#define FLASH_LED_PIN     21 // LOW is ON, HIGH is OFF
 
 bool g_livestream = false;
 unsigned long g_last_frame = 0;
 unsigned long g_last_poll = 0;
 unsigned int poll_interval_ms = 2000;
-const unsigned int LIVESTREAM_INTERVAL_MS = 200; // ~5 fps
+const unsigned int LIVESTREAM_INTERVAL_MS = 200; 
 const unsigned int NORMAL_INTERVAL_MS = 5000;
+
+unsigned long g_last_heartbeat_send = 0;
 
 void setup() {
   Serial.begin(115200);
-  // Serial1 for communicating with WROOM ESP32
-  // Using pins D6 (43) for TX and D7 (44) for RX on XIAO ESP32-S3
   Serial1.begin(115200, SERIAL_8N1, 44, 43); 
 
   pinMode(FLASH_LED_PIN, OUTPUT);
-  digitalWrite(FLASH_LED_PIN, HIGH);
+  digitalWrite(FLASH_LED_PIN, HIGH); // Start Off
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -88,6 +88,7 @@ void setup() {
 }
 
 void pollCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
   String url = SERVER_URL + "/api/v1/esp/commands/pending";
   http.begin(url);
@@ -98,13 +99,23 @@ void pollCommands() {
     DynamicJsonDocument doc(1024);
     DeserializationError error = deserializeJson(doc, payload);
     if (!error) {
-      g_livestream = doc["livestream"].as<bool>();
+      if (doc["data"].is<JsonObject>()) {
+         if (doc["data"]["livestream"].is<bool>()) {
+           g_livestream = doc["data"]["livestream"].as<bool>();
+         }
+      } else if (doc["livestream"].is<bool>()) {
+        g_livestream = doc["livestream"].as<bool>();
+      }
     }
   }
   http.end();
 }
 
 bool uploadFrame(const char* path, uint8_t* data, size_t len) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial1.println("UPLOAD_ERROR: No WiFi");
+    return false;
+  }
   HTTPClient http;
   String url = SERVER_URL + path;
   http.begin(url);
@@ -112,6 +123,13 @@ bool uploadFrame(const char* path, uint8_t* data, size_t len) {
   http.addHeader("X-API-Key", CAMERA_API_KEY);
   int code = http.POST(data, len);
   bool ok = (code == 200);
+  if (!ok) {
+    if (code < 0) {
+      Serial1.println("UPLOAD_ERROR: " + http.errorToString(code));
+    } else {
+      Serial1.println("UPLOAD_FAIL: HTTP " + String(code));
+    }
+  }
   http.end();
   return ok;
 }
@@ -119,9 +137,29 @@ bool uploadFrame(const char* path, uint8_t* data, size_t len) {
 void loop() {
   unsigned long now = millis();
   
-  if (now - g_last_poll >= poll_interval_ms) {
-    g_last_poll = now;
-    pollCommands();
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    unsigned long start_reconnect = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start_reconnect < 5000) {
+      delay(500);
+    }
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    if (now - g_last_poll >= poll_interval_ms) {
+      g_last_poll = now;
+      pollCommands();
+    }
+  }
+
+  if (now - g_last_heartbeat_send >= 3000) { 
+    g_last_heartbeat_send = now;
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial1.println("XIAO_WIFI_OK"); 
+    } else {
+      Serial1.println("XIAO_WIFI_DEAD");
+    }
   }
 
   uint32_t frame_interval = g_livestream ? LIVESTREAM_INTERVAL_MS : NORMAL_INTERVAL_MS;
@@ -136,67 +174,63 @@ void loop() {
     }
   }
   
-  // Handle commands from WROOM via Serial1
   if (Serial1.available()) {
     String cmd = Serial1.readStringUntil('\n');
     cmd.trim();
-    if (cmd == "FACE_VERIFY") {
-      digitalWrite(FLASH_LED_PIN, LOW); // Flash on
-      delay(150);
-      camera_fb_t *fb = esp_camera_fb_get();
-      digitalWrite(FLASH_LED_PIN, HIGH); // Flash off
-      
-      if (fb) {
-        // Dual-upload: Save frame to R2 Image Gallery first
-        uploadFrame("/api/v1/upload?camera_id=1", fb->buf, fb->len);
-
-        HTTPClient http;
-        http.begin(SERVER_URL + "/api/v1/face/verify");
-        http.addHeader("Content-Type", "image/jpeg");
-        http.addHeader("X-API-Key", CAMERA_API_KEY);
-        int code = http.POST(fb->buf, fb->len);
-        if (code == 200) {
-          String res = http.getString();
-          DynamicJsonDocument doc(1024);
-          deserializeJson(doc, res);
-          bool granted = doc["granted"].as<bool>();
-          if (granted) {
-            Serial1.println("FACE_SUCCESS");
-          } else {
-            Serial1.println("FACE_FAIL");
-          }
-        } else {
-          Serial1.println("FACE_ERROR");
-        }
-        http.end();
-        esp_camera_fb_return(fb);
-      } else {
-        Serial1.println("FACE_ERROR");
-      }
-    } else if (cmd.startsWith("FACE_ENROLL ")) {
-      String name = cmd.substring(12);
-      
-      digitalWrite(FLASH_LED_PIN, LOW);
-      delay(150);
-      camera_fb_t *fb = esp_camera_fb_get();
-      digitalWrite(FLASH_LED_PIN, HIGH);
-      
-      if (fb) {
-        HTTPClient http;
-        http.begin(SERVER_URL + "/api/v1/face/enroll?name=" + name);
-        http.addHeader("Content-Type", "image/jpeg");
-        http.addHeader("X-API-Key", CAMERA_API_KEY);
-        int code = http.POST(fb->buf, fb->len);
-        if (code == 200) {
-          Serial1.println("ENROLL_SUCCESS");
-        } else {
-          Serial1.println("ENROLL_FAIL");
-        }
-        http.end();
-        esp_camera_fb_return(fb);
-      } else {
-        Serial1.println("ENROLL_FAIL");
-      }
+    
+    // Turn flash on when countdown starts on screen
+    if (cmd == "FLASH_ON") {
+      digitalWrite(FLASH_LED_PIN, LOW); 
     }
+    else if (cmd == "FACE_VERIFY") {
+      digitalWrite(FLASH_LED_PIN, LOW); // Ensure flash is active
+      delay(50);
+      
+      camera_fb_t *fb = esp_camera_fb_get();
+      Serial1.println("photo taken");
+      
+      // Turn flash off immediately after capture
+      digitalWrite(FLASH_LED_PIN, HIGH); 
+      
+      if (fb) {
+        uploadFrame("/api/v1/upload", fb->buf, fb->len);
+
+        if (WiFi.status() == WL_CONNECTED) {
+          HTTPClient http;
+          http.begin(SERVER_URL + "/api/v1/face/verify");
+          http.addHeader("Content-Type", "image/jpeg");
+          http.addHeader("X-API-Key", CAMERA_API_KEY);
+          int code = http.POST(fb->buf, fb->len);
+          if (code > 0) {
+            if (code == 200) {
+              String res = http.getString();
+              DynamicJsonDocument doc(1024);
+              deserializeJson(doc, res);
+              bool granted = false;
+              if (doc["data"].is<JsonObject>()) {
+                granted = doc["data"]["granted"].as<bool>();
+              } else {
+                granted = doc["granted"].as<bool>();
+              }
+              if (granted) {
+                Serial1.println("FACE_SUCCESS");
+              } else {
+                Serial1.println("FACE_FAIL");
+              }
+            } else {
+              Serial1.println("FACE_ERROR: HTTP " + String(code));
+            }
+          } else {
+            Serial1.println("FACE_NET_ERROR: " + http.errorToString(code));
+          }
+          http.end();
+        } else {
+          Serial1.println("FACE_NET_ERROR: No WiFi");
+        }
+        esp_camera_fb_return(fb);
+      } else {
+        Serial1.println("FACE_ERROR: Camera capture failed");
+      }
+    } 
   }
 }
